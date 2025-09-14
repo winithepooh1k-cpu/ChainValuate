@@ -1,0 +1,180 @@
+(define-constant ERR-NOT-ORACLE u100)
+(define-constant ERR-INVALID-PROPERTY-ID u101)
+(define-constant ERR-INVALID-PRICE u102)
+(define-constant ERR-INSUFFICIENT-ORACLES u103)
+(define-constant ERR-CONSENSUS-FAILED u104)
+(define-constant ERR-STALE-DATA u105)
+(define-constant ERR-ORACLE-NOT-APPROVED u106)
+(define-constant ERR-MAX-ORACLES-EXCEEDED u107)
+(define-constant ERR-INVALID-WEIGHT u108)
+(define-constant ERR-VALUATION-NOT-FOUND u109)
+(define-constant ERR-INVALID-TIMESTAMP u110)
+(define-constant ERR-MAX-SUBMISSIONS u111)
+(define-constant ERR-UNAUTHORIZED u500)
+
+(define-data-var approved-oracles (list 50 principal) (list))
+(define-data-var max-oracles uint u10)
+(define-data-var consensus-threshold uint u3)
+(define-data-var max-submissions uint u5)
+(define-data-var staleness-threshold uint u3600)
+(define-data-var owner principal tx-sender)
+
+(define-map oracle-weights { oracle: principal } uint)
+(define-map property-valuations { property-id: uint } { value: uint, timestamp: uint, sources: uint })
+(define-map submission-history { property-id: uint, oracle: principal } { price: uint, timestamp: uint })
+(define-map oracle-submissions { oracle: principal } { count: uint, last-active: uint })
+
+(define-read-only (get-valuation (property-id uint))
+  (map-get? property-valuations { property-id: property-id })
+)
+
+(define-read-only (get-oracle-weight (oracle principal))
+  (map-get? oracle-weights { oracle: oracle })
+)
+
+(define-read-only (get-submission-history (property-id uint) (oracle principal))
+  (map-get? submission-history { property-id: property-id, oracle: oracle })
+)
+
+(define-read-only (is-oracle-approved (oracle principal))
+  (is-some (index-of (var-get approved-oracles) oracle))
+)
+
+(define-read-only (get-oracle-submissions (oracle principal))
+  (map-get? oracle-submissions { oracle: oracle })
+)
+
+(define-private (validate-property-id (id uint))
+  (if (> id u0) (ok true) (err ERR-INVALID-PROPERTY-ID))
+)
+
+(define-private (validate-price (price uint))
+  (if (> price u0) (ok true) (err ERR-INVALID-PRICE))
+)
+
+(define-private (validate-oracle (oracle principal))
+  (if (is-some (index-of (var-get approved-oracles) oracle))
+      (ok true)
+      (err ERR-ORACLE-NOT-APPROVED))
+)
+
+(define-private (validate-timestamp (ts uint))
+  (if (>= ts (- block-height (var-get staleness-threshold))) (ok true) (err ERR-STALE-DATA))
+)
+
+(define-private (validate-submission-count (oracle principal))
+  (let ((sub (default-to { count: u0, last-active: u0 } (map-get? oracle-submissions { oracle: oracle }))))
+    (if (<= (get count sub) (var-get max-submissions)) (ok true) (err ERR-MAX-SUBMISSIONS))
+  )
+)
+
+(define-private (calculate-weighted-median (prices (list 10 uint)) (weights (list 10 uint)))
+  (let (
+        (total-weight (fold + weights u0))
+        (sorted-prices (sort prices <))
+        (mid (if (> (len sorted-prices) u0) (/ (len sorted-prices) u2) u0))
+        (median (if (> mid u0) (unwrap! (element-at sorted-prices mid) (err ERR-CONSENSUS-FAILED)) u0))
+      )
+    (if (>= (len prices) (var-get consensus-threshold))
+        (ok median)
+        (err ERR-INSUFFICIENT-ORACLES)
+    )
+  )
+)
+
+(define-private (validate-weight (weight uint))
+  (if (and (> weight u0) (<= weight u100)) (ok true) (err ERR-INVALID-WEIGHT))
+)
+
+(define-private (update-submission-count (oracle principal))
+  (let ((sub (default-to { count: u0, last-active: u0 } (map-get? oracle-submissions { oracle: oracle }))))
+    (map-set oracle-submissions { oracle: oracle }
+      { count: (+ (get count sub) u1), last-active: block-height }
+    )
+  )
+)
+
+(define-private (store-submission (property-id uint) (oracle principal) (price uint))
+  (map-set submission-history { property-id: property-id, oracle: oracle }
+    { price: price, timestamp: block-height }
+  )
+  (ok true)
+)
+
+(define-private (compute-consensus (property-id uint) (prices (list 10 uint)) (weights (list 10 uint)) (oracles (list 10 principal)))
+  (let (
+        (median-result (try! (calculate-weighted-median prices weights)))
+      )
+    (map-set property-valuations { property-id: property-id }
+      { value: median-result, timestamp: block-height, sources: (len oracles) }
+    )
+    (ok median-result)
+  )
+)
+
+(define-public (add-oracle (oracle principal) (weight uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get owner)) (err ERR-UNAUTHORIZED))
+    (asserts! (not (is-some (index-of (var-get approved-oracles) oracle))) (err ERR-ORACLE-NOT-APPROVED))
+    (try! (validate-weight weight))
+    (let ((current-oracles (var-get approved-oracles)))
+      (asserts! (< (len current-oracles) (var-get max-oracles)) (err ERR-MAX-ORACLES-EXCEEDED))
+      (var-set approved-oracles (as-max-len? (append current-oracles oracle) u50))
+      (map-set oracle-weights { oracle: oracle } weight)
+      (ok true)
+    )
+  )
+)
+
+(define-public (submit-data-feed (property-id uint) (price uint) (oracle principal))
+  (begin
+    (asserts! (is-eq oracle tx-sender) (err ERR-NOT-ORACLE))
+    (try! (validate-property-id property-id))
+    (try! (validate-price price))
+    (try! (validate-oracle oracle))
+    (try! (validate-timestamp block-height))
+    (try! (validate-submission-count oracle))
+    (let (
+          (existing (map-get? property-valuations { property-id: property-id }))
+          (current-oracles (var-get approved-oracles))
+          (current-weights (map get-oracle-weight current-oracles))
+          (current-prices (map (lambda (o) (default-to u0 (get price (map-get? submission-history { property-id: property-id, oracle: o })))) current-oracles))
+        )
+      (try! (store-submission property-id oracle price))
+      (update-submission-count oracle)
+      (if (is-some existing)
+          (begin
+            (let ((sources (get sources (unwrap! existing (err ERR-VALUATION-NOT-FOUND)))))
+              (if (>= sources (var-get consensus-threshold))
+                  (ok (get value (unwrap! existing (err ERR-VALUATION-NOT-FOUND))))
+                  (try! (compute-consensus property-id (filter (lambda (x) (> x u0)) current-prices) (filter (lambda (x) (> x u0)) current-weights) current-oracles))
+              )
+            )
+          )
+          (try! (compute-consensus property-id (filter (lambda (x) (> x u0)) current-prices) (filter (lambda (x) (> x u0)) current-weights) current-oracles))
+      )
+      (ok price)
+    )
+  )
+)
+
+(define-public (remove-oracle (oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get owner)) (err ERR-UNAUTHORIZED))
+    (try! (validate-oracle oracle))
+    (let ((current-oracles (var-get approved-oracles)))
+      (var-set approved-oracles (filter (lambda (o) (not (is-eq o oracle))) current-oracles))
+      (map-delete oracle-weights { oracle: oracle })
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-consensus-threshold (threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get owner)) (err ERR-UNAUTHORIZED))
+    (asserts! (and (> threshold u0) (<= threshold u10)) (err ERR-INVALID-WEIGHT))
+    (var-set consensus-threshold threshold)
+    (ok true)
+  )
+)
